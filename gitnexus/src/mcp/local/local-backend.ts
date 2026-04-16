@@ -1071,6 +1071,55 @@ export class LocalBackend {
   }
 
   /**
+   * Patch the `type` field on candidates whose `labels(n)[0]` projection
+   * came back empty — a known LadybugDB behaviour for several node types.
+   *
+   * Uses one scoped UNION query across the five priority labels rather
+   * than per-candidate round-trips, so cost is a single DB call regardless
+   * of how many candidates need enrichment. No-op when every candidate
+   * already has a non-empty type.
+   *
+   * Failures are swallowed: label enrichment is an optimisation for
+   * downstream scoring and #480 Class/Interface BFS seeding; if it fails
+   * the symbol still resolves, just without the kind-priority bonus.
+   */
+  private async enrichCandidateLabels(
+    repo: RepoHandle,
+    candidates: Array<{ id: string; type: string }>,
+  ): Promise<void> {
+    const ids = candidates.filter((c) => c.type === '' && c.id).map((c) => c.id);
+    if (ids.length === 0) return;
+    try {
+      const rows = await executeParameterized(
+        repo.id,
+        `
+        MATCH (n:\`Class\`) WHERE n.id IN $ids RETURN n.id AS id, 'Class' AS label
+        UNION ALL
+        MATCH (n:\`Interface\`) WHERE n.id IN $ids RETURN n.id AS id, 'Interface' AS label
+        UNION ALL
+        MATCH (n:\`Function\`) WHERE n.id IN $ids RETURN n.id AS id, 'Function' AS label
+        UNION ALL
+        MATCH (n:\`Method\`) WHERE n.id IN $ids RETURN n.id AS id, 'Method' AS label
+        UNION ALL
+        MATCH (n:\`Constructor\`) WHERE n.id IN $ids RETURN n.id AS id, 'Constructor' AS label
+        `,
+        { ids },
+      );
+      const labelById = new Map<string, string>();
+      for (const r of rows as any[]) {
+        const id = (r.id ?? r[0]) as string;
+        const label = (r.label ?? r[1]) as string;
+        if (id && label && !labelById.has(id)) labelById.set(id, label);
+      }
+      for (const c of candidates) {
+        if (c.type === '' && labelById.has(c.id)) c.type = labelById.get(c.id) as string;
+      }
+    } catch {
+      /* best-effort — downstream resolvers still work without the label */
+    }
+  }
+
+  /**
    * Score a symbol candidate for disambiguation ranking.
    *
    * Deterministic, no DB round-trip:
@@ -1171,19 +1220,20 @@ export class LocalBackend {
       );
       if (rows.length === 0) return { kind: 'not_found' };
       const r = rows[0] as any;
-      return {
-        kind: 'ok',
-        symbol: {
-          id: r.id ?? r[0],
-          name: r.name ?? r[1],
-          type: r.type ?? r[2] ?? '',
-          filePath: r.filePath ?? r[3],
-          startLine: r.startLine ?? r[4],
-          endLine: r.endLine ?? r[5],
-          ...(include_content ? { content: r.content ?? r[6] } : {}),
-        },
-        resolvedLabel: '',
+      const symbol = {
+        id: (r.id ?? r[0]) as string,
+        name: (r.name ?? r[1]) as string,
+        type: (r.type ?? r[2] ?? '') as string,
+        filePath: (r.filePath ?? r[3]) as string,
+        startLine: (r.startLine ?? r[4]) as number,
+        endLine: (r.endLine ?? r[5]) as number,
+        ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
       };
+      // Same LadybugDB label-enrichment as the name-based path: a UID
+      // pointing at a Class must still surface `type: 'Class'` so impact's
+      // Class/Interface BFS seed fires. No-op when type is already set.
+      await this.enrichCandidateLabels(repo, [symbol]);
+      return { kind: 'ok', symbol, resolvedLabel: symbol.type };
     }
 
     if (!name) return { kind: 'not_found' };
@@ -1221,12 +1271,22 @@ export class LocalBackend {
       ...(include_content ? { content: (r.content ?? r[6]) as string | undefined } : {}),
     }));
 
+    // Enrich labels for any candidates where `labels(n)[0]` came back empty.
+    // LadybugDB returns an empty string for that projection on certain node
+    // types (notably Class), which left downstream consumers (impact's
+    // Class/Interface BFS seed, the kind-priority scoring bonus) unable to
+    // distinguish a Class target from "unknown kind". One scoped UNION
+    // across the five priority labels patches the type in-place without
+    // per-candidate round-trips.
+    await this.enrichCandidateLabels(repo, normalized);
+
     // Preserve #480 Class/Constructor collapse: if we have exactly one
     // Class (or Interface) candidate and one Constructor sharing name +
     // filePath, fold into the Class. This used to require a follow-up
     // label query because LadybugDB sometimes returns an empty labels()[0]
-    // for Class nodes — we still fall back to that check when type is
-    // blank on at least one candidate.
+    // for Class nodes — enrichment above handles the empty-type case, but
+    // the `type === 'Constructor'` gate still correctly triggers when a
+    // Class and its Constructor share the name.
     if (!hints.kind && normalized.length > 1) {
       const ambiguousType = normalized.some((s) => s.type === '' || s.type === 'Constructor');
       if (ambiguousType) {
@@ -1273,10 +1333,24 @@ export class LocalBackend {
       return String(a.id).localeCompare(String(b.id));
     });
 
-    // Confident single-result: top score ≥ 0.95 AND beats runner-up by ≥ 0.10.
-    // This lets a very strong file_path/kind hint resolve cleanly instead of
-    // forcing the caller through a disambiguation round-trip.
-    if (scored.length >= 2 && scored[0].score >= 0.95 && scored[0].score - scored[1].score >= 0.1) {
+    // Confident single-result: top score ≥ 0.95 AND beats runner-up by a
+    // clear margin. This lets a very strong file_path/kind hint resolve
+    // cleanly instead of forcing the caller through a disambiguation
+    // round-trip.
+    //
+    // The gap threshold uses `> 0.09` rather than `>= 0.10` on purpose:
+    // IEEE754 addition of the scoring terms (0.50 + 0.40 + 0.20 - 0.90
+    // yields 0.09999999999999998, not exactly 0.10) would otherwise break
+    // the comparison for legitimate "top is 1.00, runner is 0.90" cases.
+    // The intent is a clearly-dominant winner; 0.09 is a large enough
+    // margin to mean that unambiguously.
+    //
+    // The `scored.length >= 2` guard is defensive. The `normalized.length === 1`
+    // early return above already handles the single-candidate path, so in
+    // practice `scored` always has at least two elements by the time we get
+    // here — keeping the guard means changes to the upstream early-return
+    // logic cannot accidentally index out of bounds at `scored[1]`.
+    if (scored.length >= 2 && scored[0].score >= 0.95 && scored[0].score - scored[1].score > 0.09) {
       return { kind: 'ok', symbol: scored[0], resolvedLabel: scored[0].type };
     }
 

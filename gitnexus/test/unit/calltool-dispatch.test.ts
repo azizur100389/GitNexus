@@ -282,11 +282,54 @@ describe('LocalBackend.callTool', () => {
       name: 'handleConnect',
       file_path: 'App.tsx',
     });
-    // Single confident match expected (App.tsx hit gets 0.50 base + 0.40
-    // file_path bonus + 0.06 Function priority = 0.96 ≥ 0.95 threshold and
-    // beats the other candidate by > 0.10).
+    // In production, `WHERE n.filePath CONTAINS $filePath` would pre-filter
+    // at the DB layer and only `src/App.tsx` would come back — resolving
+    // via the single-candidate early return rather than via scoring. The
+    // `executeParameterized` mock here returns both rows regardless of the
+    // WHERE clause parameters, so this asserts that the resolver ends up
+    // picking the App.tsx candidate in either case (via mock-relaxed DB
+    // pre-filter or via scoring promotion). The dedicated scoring-promotion
+    // path is covered by the next `it()` block below.
     expect(result.status).toBe('found');
     expect(result.symbol.filePath).toBe('src/App.tsx');
+  });
+
+  it('context tool promotes top candidate via scoring when multiple rows survive DB pre-filter (#470)', async () => {
+    // This test explicitly exercises the scored-promotion path (#470
+    // review): both candidates satisfy the file_path hint (so DB
+    // pre-filter would return both in production), and promotion is
+    // determined purely by the combined file_path + kind score.
+    (executeParameterized as any).mockResolvedValue([
+      {
+        id: 'fn:App:1',
+        name: 'render',
+        type: 'Function',
+        filePath: 'src/components/App.tsx',
+        startLine: 10,
+        endLine: 20,
+      },
+      {
+        id: 'method:App:1',
+        name: 'render',
+        type: 'Method',
+        filePath: 'src/pages/App.tsx',
+        startLine: 5,
+        endLine: 15,
+      },
+    ]);
+    const result = await backend.callTool('context', {
+      name: 'render',
+      file_path: 'App.tsx',
+      kind: 'Function',
+    });
+    // Expected scoring:
+    //   Function candidate: 0.50 base + 0.40 file_path + 0.20 kind = 1.10 → cap 1.00
+    //   Method candidate:   0.50 base + 0.40 file_path + 0.00 kind = 0.90
+    // Top score ≥ 0.95 and beats runner-up by 0.10 → confident promotion
+    // to `{ status: 'found' }` with the Function.
+    expect(result.status).toBe('found');
+    expect(result.symbol.filePath).toBe('src/components/App.tsx');
+    expect(result.symbol.kind).toBe('Function');
   });
 
   it('context tool returns ranked candidates when file_path only partially narrows (#470)', async () => {
