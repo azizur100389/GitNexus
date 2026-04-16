@@ -327,6 +327,10 @@ function createUser(payload) {
 $.ajax({ url: '/api/orders', method: 'PUT', data: {} });
 $.ajax({ url: '/api/items',  type:   'DELETE' });
 $.ajax({ url: '/api/default' });
+
+function reloadOrder(id) {
+  return $.ajax({ url: \`/api/orders/\${id}\`, method: 'GET' });
+}
 `,
       );
 
@@ -336,6 +340,12 @@ $.ajax({ url: '/api/default' });
       expect(consumers.find((c) => c.contractId === 'http::PUT::/api/orders')).toBeDefined();
       expect(consumers.find((c) => c.contractId === 'http::DELETE::/api/items')).toBeDefined();
       expect(consumers.find((c) => c.contractId === 'http::GET::/api/default')).toBeDefined();
+      // Template-literal URL inside $.ajax is normalized to {param} the same
+      // way the fetch/axios paths do — confirms readStringProp accepts
+      // template_string values for jQuery ajax, not just for axios object form.
+      expect(
+        consumers.find((c) => c.contractId === 'http::GET::/api/orders/{param}'),
+      ).toBeDefined();
     });
 
     it('extracts axios({ method, url }) object form regardless of key order', async () => {
