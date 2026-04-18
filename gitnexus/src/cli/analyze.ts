@@ -13,7 +13,11 @@ import { execFileSync } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { closeLbug } from '../core/lbug/lbug-adapter.js';
-import { getStoragePaths, getGlobalRegistryPath } from '../storage/repo-manager.js';
+import {
+  getStoragePaths,
+  getGlobalRegistryPath,
+  RegistryNameCollisionError,
+} from '../storage/repo-manager.js';
 import { getGitRoot, hasGitDir } from '../storage/git.js';
 import { runFullAnalysis } from '../core/run-analyze.js';
 import fs from 'fs/promises';
@@ -59,6 +63,13 @@ export interface AnalyzeOptions {
   noStats?: boolean;
   /** Index the folder even when no .git directory is present. */
   skipGit?: boolean;
+  /**
+   * Override the default basename-derived registry `name` with a
+   * user-supplied alias (#829). Disambiguates repos whose paths share a
+   * basename. Persisted — subsequent re-analyses of the same path without
+   * `--name` preserve the alias.
+   */
+  name?: string;
 }
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
@@ -191,6 +202,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
         skipGit: options?.skipGit,
         skipAgentsMd: options?.skipAgentsMd,
         noStats: options?.noStats,
+        registryName: options?.name,
       },
       {
         onProgress: (_phase, percent, message) => {
@@ -298,6 +310,22 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     bar.stop();
 
     const msg = err.message || String(err);
+
+    // Registry name-collision from --name (#829) — surface as an
+    // actionable error rather than a generic stack-trace.
+    if (err instanceof RegistryNameCollisionError) {
+      console.error(`\n  Registry name collision:\n`);
+      console.error(`    "${err.name}" is already used by "${err.existingPath}".\n`);
+      console.error(`  Options:`);
+      console.error(`    • Pick a different alias:  gitnexus analyze --name <alias>`);
+      console.error(
+        `    • Force the duplicate:     gitnexus analyze --force  (leaves "-r ${err.name}" ambiguous)`,
+      );
+      console.error('');
+      process.exitCode = 1;
+      return;
+    }
+
     console.error(`\n  Analysis failed: ${msg}\n`);
 
     // Provide helpful guidance for known failure modes

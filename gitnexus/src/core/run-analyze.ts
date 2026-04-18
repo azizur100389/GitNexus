@@ -53,6 +53,12 @@ export interface AnalyzeOptions {
   skipAgentsMd?: boolean;
   /** Omit volatile symbol/relationship counts from AGENTS.md and CLAUDE.md. */
   noStats?: boolean;
+  /**
+   * User-provided alias for the registry `name` (#829). When set,
+   * forwarded to `registerRepo` so the indexed repo is stored under
+   * this alias instead of the path-derived basename.
+   */
+  registryName?: string;
 }
 
 export interface AnalyzeResult {
@@ -313,7 +319,7 @@ export async function runFullAnalysis(
       },
     };
     await saveMeta(storagePath, meta);
-    await registerRepo(repoPath, meta);
+    await registerRepo(repoPath, meta, { name: options.registryName });
 
     // Only attempt to update .gitignore when a .git directory is present.
     if (hasGitDir(repoPath)) {
