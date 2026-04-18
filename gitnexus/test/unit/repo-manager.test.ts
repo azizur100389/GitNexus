@@ -232,9 +232,9 @@ describe('registerRepo name override + collision guard (#829)', () => {
     expect(entries[0].name).toBe('shared');
   });
 
-  it('registerRepo({ name, force: true }) allows the duplicate to coexist', async () => {
+  it('registerRepo({ name, allowDuplicateName: true }) allows the duplicate to coexist', async () => {
     await registerRepo(tmpRepoA.dbPath, meta, { name: 'shared' });
-    await registerRepo(tmpRepoB.dbPath, meta, { name: 'shared', force: true });
+    await registerRepo(tmpRepoB.dbPath, meta, { name: 'shared', allowDuplicateName: true });
 
     const entries = await listRegisteredRepos();
     expect(entries).toHaveLength(2);

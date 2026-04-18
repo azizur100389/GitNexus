@@ -33,6 +33,11 @@ program
     'Register this repo under a custom name in ~/.gitnexus/registry.json ' +
       '(disambiguates repos whose paths share a basename, e.g. two different .../app folders)',
   )
+  .option(
+    '--allow-duplicate-name',
+    'Register this repo even if another path already uses the same --name alias. ' +
+      'Leaves `-r <name>` ambiguous for the two paths; use -r <path> to disambiguate.',
+  )
   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
   .addHelpText(
     'after',

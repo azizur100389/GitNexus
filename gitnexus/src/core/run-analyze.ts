@@ -50,7 +50,7 @@ export interface AnalyzeOptions {
    * Force a full re-index of the pipeline. Callers may OR this with
    * other flags that imply re-analysis (e.g. `--skills`), so the value
    * here is the PIPELINE-force signal, NOT the registry-collision
-   * bypass. See `registryForce` below.
+   * bypass. See `allowDuplicateName` below.
    */
   force?: boolean;
   embeddings?: boolean;
@@ -67,14 +67,13 @@ export interface AnalyzeOptions {
   registryName?: string;
   /**
    * Bypass the `RegistryNameCollisionError` guard and allow two paths
-   * to register under the same `name` (#829). Semantically distinct
-   * from `force` above — the pipeline may be force-re-indexed for
-   * many reasons (`--skills`, future flags), but registry-collision
-   * bypass requires the user to have explicitly passed `--force`.
-   * Conflating the two (as an earlier draft of this feature did)
-   * meant `--skills` silently bypassed the collision guard.
+   * to register under the same `name` (#829). Controlled by the
+   * dedicated `--allow-duplicate-name` CLI flag, intentionally
+   * independent from `--force` — users who hit the collision guard
+   * should be able to accept the duplicate without paying the cost
+   * of a pipeline re-index.
    */
-  registryForce?: boolean;
+  allowDuplicateName?: boolean;
 }
 
 export interface AnalyzeResult {
@@ -335,17 +334,14 @@ export async function runFullAnalysis(
       },
     };
     await saveMeta(storagePath, meta);
-    // Forward the --name alias AND the registry-specific force bit.
-    // Note: `options.registryForce` is distinct from `options.force`
-    // (the pipeline re-index signal). The CLI only sets registryForce
-    // when the user explicitly passes --force; --skills (which sets
-    // force for pipeline re-analysis) does NOT set registryForce, so
-    // --name + --skills without --force correctly hits the collision
-    // guard. See #829 review round 2 for the --skills bypass regression
-    // this split prevents.
+    // Forward the --name alias and the registry-collision bypass bit.
+    // `allowDuplicateName` is its own concern — independent from the
+    // pipeline `force` above. The CLI maps it from
+    // `--allow-duplicate-name` only; `--force` and `--skills` both
+    // trigger pipeline re-run but never bypass the registry guard.
     await registerRepo(repoPath, meta, {
       name: options.registryName,
-      force: options.registryForce,
+      allowDuplicateName: options.allowDuplicateName,
     });
 
     // Only attempt to update .gitignore when a .git directory is present.

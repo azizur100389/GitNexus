@@ -257,11 +257,13 @@ export interface RegisterRepoOptions {
    */
   name?: string;
   /**
-   * Allow registration even when another path already uses this name.
-   * Required for intentional same-name coexistence (two different
-   * same-basename `app` repos, for instance) without passing `--name`.
+   * Allow registration even when another path already uses this name
+   * (#829). Mapped from the `--allow-duplicate-name` CLI flag —
+   * intentionally a distinct flag from `--force` (which only triggers
+   * pipeline re-index) because a user accepting a duplicate name should
+   * not be forced to also re-run the full pipeline.
    */
-  force?: boolean;
+  allowDuplicateName?: boolean;
 }
 
 /**
@@ -285,7 +287,7 @@ export class RegistryNameCollisionError extends Error {
     super(
       `Registry name "${registryName}" is already used by "${existingPath}".\n` +
         `Pass --name <alias> to register "${requestedPath}" under a different name, ` +
-        `or --force to allow both paths under the same name (leaves -r <name> ambiguous for these two).`,
+        `or --allow-duplicate-name to allow both paths under the same name (leaves -r <name> ambiguous for these two).`,
     );
     this.name = 'RegistryNameCollisionError';
   }
@@ -309,8 +311,8 @@ const hasCustomAlias = (entry: RegistryEntry): boolean => {
  *   3. `path.basename(repoPath)` (the original default)
  *
  * Duplicate-name guard: if another path already uses the resolved
- * `name`, throw {@link RegistryNameCollisionError} unless `opts.force`
- * is set. The guard ONLY fires when the user explicitly passed a
+ * `name`, throw {@link RegistryNameCollisionError} unless
+ * `opts.allowDuplicateName` is set. The guard ONLY fires when the user explicitly passed a
  * `name`; un-aliased basename collisions continue to register silently
  * so existing users who don't know about `--name` see no behaviour
  * change.
@@ -342,7 +344,7 @@ export const registerRepo = async (
   // (which is already improved by the disambiguated error messages and
   // list output this PR also ships).
   const explicitName = opts?.name !== undefined || (existing && hasCustomAlias(existing));
-  if (explicitName && !opts?.force) {
+  if (explicitName && !opts?.allowDuplicateName) {
     const collision = entries.find(
       (e, i) =>
         i !== existingIdx &&

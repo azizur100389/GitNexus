@@ -70,6 +70,14 @@ export interface AnalyzeOptions {
    * `--name` preserve the alias.
    */
   name?: string;
+  /**
+   * Allow registration even when another path already uses the same
+   * `--name` alias (#829). Intentionally a distinct flag from `--force`
+   * because the user may want to coexist under the same name WITHOUT
+   * paying the cost of a pipeline re-index. Maps to registerRepo's
+   * `allowDuplicateName` option end-to-end.
+   */
+  allowDuplicateName?: boolean;
 }
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
@@ -198,20 +206,19 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
       repoPath,
       {
         // Pipeline re-index — OR'd with --skills because skill generation
-        // needs a fresh pipelineResult. This is intentional and has no
-        // bearing on the registry collision guard (see registryForce below).
+        // needs a fresh pipelineResult. Has no bearing on the registry
+        // collision guard (see allowDuplicateName below).
         force: options?.force || options?.skills,
         embeddings: options?.embeddings,
         skipGit: options?.skipGit,
         skipAgentsMd: options?.skipAgentsMd,
         noStats: options?.noStats,
         registryName: options?.name,
-        // Registry-collision bypass — only the explicit --force flag.
-        // Keeping this separate from `force` above means --skills (and any
-        // future flag that triggers pipeline re-run) does NOT accidentally
-        // bypass the RegistryNameCollisionError guard. See #829 review
-        // round 2.
-        registryForce: options?.force,
+        // Registry-collision bypass — its own CLI flag, intentionally NOT
+        // overloading --force. A user who hits the collision guard should
+        // be able to accept the duplicate name without also paying the
+        // cost of a full pipeline re-index. See #829 review round 2.
+        allowDuplicateName: options?.allowDuplicateName,
       },
       {
         onProgress: (_phase, percent, message) => {
@@ -328,7 +335,7 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
       console.error(`  Options:`);
       console.error(`    • Pick a different alias:  gitnexus analyze --name <alias>`);
       console.error(
-        `    • Force the duplicate:     gitnexus analyze --force  (leaves "-r ${err.registryName}" ambiguous)`,
+        `    • Allow the duplicate:     gitnexus analyze --allow-duplicate-name  (leaves "-r ${err.registryName}" ambiguous)`,
       );
       console.error('');
       process.exitCode = 1;

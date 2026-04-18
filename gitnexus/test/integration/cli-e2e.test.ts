@@ -193,33 +193,37 @@ describe('CLI end-to-end', () => {
     expect(fs.statSync(gitnexusDir).isDirectory()).toBe(true);
   });
 
-  // ─── analyze --name <alias> + --force (#829) ───────────────────────
+  // ─── analyze --name <alias> + --allow-duplicate-name (#829) ──────
   //
   // End-to-end regression guard for the name-collision feature:
   //   1. `analyze --name X` persists the alias to ~/.gitnexus/registry.json
   //   2. A second `analyze --name X` on a DIFFERENT path is rejected with
   //      a collision error (exit code 1, "already used" in output)
-  //   3. A second `analyze --name X --force` bypasses the guard and both
-  //      entries coexist in registry.json
+  //   3. `analyze --name X --allow-duplicate-name` bypasses the guard;
+  //      both entries coexist in registry.json
+  //   4. Pipeline-re-index flags (e.g. --skills) WITHOUT
+  //      --allow-duplicate-name must STILL hit the collision guard —
+  //      the bypass must stay gated on its dedicated flag so it isn't
+  //      silently triggered by unrelated pipeline signals
+  //      (review round 2/3 design decision).
   //
-  // The third assertion is the regression guard for the blocking bug
-  // caught in the first round of review: `--force` was documented in the
-  // error hint but not forwarded to registerRepo, so following the
-  // documented workaround produced the same error. This test invokes
-  // the real CLI → runFullAnalysis → registerRepo chain, so the
-  // passthrough bug cannot slip back in silently.
-  describe('analyze --name <alias> and --force (#829)', () => {
-    // Canonicalize paths for cross-platform equality checks. On macOS
-    // os.tmpdir() returns /var/folders/... but spawnSync child processes
-    // see the symlink-resolved /private/var/folders/... form, so the
-    // registry stores the realpath. On Windows, os.tmpdir() can return
-    // the 8.3 short-name form (C:\Users\RUNNER~1\...) while the spawned
-    // CLI process sees the long form (C:\Users\runneradmin\...).
-    // fs.realpathSync() canonicalizes both so assertions don't break on
-    // platform-specific path quirks.
-    const canonical = (p: string): string => fs.realpathSync(p);
+  // This test invokes the real CLI → runFullAnalysis → registerRepo
+  // chain, so any wiring regression fails here.
+  describe('analyze --name <alias> and --allow-duplicate-name (#829)', () => {
+    // Path-equality assertions across CLI spawn boundaries are fragile
+    // cross-platform:
+    //   - macOS: os.tmpdir() returns /var/folders/...; child processes
+    //     resolve the symlink to /private/var/folders/...
+    //   - Windows: os.tmpdir() on GitHub runners returns 8.3 short-name
+    //     form (C:\Users\RUNNER~1\...); the child sees the long form
+    //     (C:\Users\runneradmin\...). fs.realpathSync does NOT reliably
+    //     expand 8.3 to long form.
+    // Rather than fight the platform-path quagmire, we assert STRUCTURAL
+    // properties: entry count, alias value, path basename, path
+    // distinctness. That covers the behavior this test is here to
+    // protect without depending on exact-string path equality.
 
-    it('--name alias stores; collision rejects; --force bypasses', () => {
+    it('--name alias stores; collision rejects; --allow-duplicate-name bypasses', () => {
       // Isolate the global registry so this test never touches the
       // developer's real ~/.gitnexus.
       const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-'));
@@ -251,7 +255,7 @@ describe('CLI end-to-end', () => {
         expect(Array.isArray(afterStep1)).toBe(true);
         expect(afterStep1).toHaveLength(1);
         expect(afterStep1[0].name).toBe('shared');
-        expect(canonical(afterStep1[0].path)).toBe(canonical(repoA));
+        expect(path.basename(afterStep1[0].path)).toBe('collide-app');
 
         // Step 2: analyze repoB with the SAME --name → collision error.
         const r2 = runCliWithEnv(
@@ -269,13 +273,16 @@ describe('CLI end-to-end', () => {
         // silently added, overwritten, or corrupted anything.
         const afterStep2 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
         expect(afterStep2).toHaveLength(1);
-        expect(canonical(afterStep2[0].path)).toBe(canonical(repoA));
+        // Registry still has only the step-1 entry — the failed call
+        // must not have silently added, overwritten, or corrupted state.
+        expect(afterStep2[0].path).toBe(afterStep1[0].path);
 
-        // Step 3: REGRESSION GUARD for the missing --force passthrough bug.
-        // Same args as step 2 but with --force → must succeed, and the
-        // registry must now contain BOTH entries under name "shared".
+        // Step 3: REGRESSION GUARD for the missing collision-bypass wire
+        // (originally a --force passthrough bug; per review round 3 the
+        // bypass moved to its own --allow-duplicate-name flag to avoid
+        // conflating it with pipeline re-index).
         const r3 = runCliWithEnv(
-          ['analyze', '--name', 'shared', '--force'],
+          ['analyze', '--name', 'shared', '--allow-duplicate-name'],
           repoB,
           { GITNEXUS_HOME: gnHome },
           60000,
@@ -284,7 +291,7 @@ describe('CLI end-to-end', () => {
         expect(
           r3.status,
           [
-            `step 3 (--force bypass) exited with ${r3.status}`,
+            `step 3 (--allow-duplicate-name bypass) exited with ${r3.status}`,
             `stdout: ${r3.stdout}`,
             `stderr: ${r3.stderr}`,
           ].join('\n'),
@@ -293,15 +300,21 @@ describe('CLI end-to-end', () => {
         const afterStep3 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
         expect(afterStep3).toHaveLength(2);
         expect(afterStep3.every((e: { name: string }) => e.name === 'shared')).toBe(true);
-        const paths = afterStep3.map((e: { path: string }) => canonical(e.path)).sort();
-        expect(paths).toEqual([canonical(repoA), canonical(repoB)].sort());
+        // Both entries point to distinct paths (we registered two different
+        // repos under the same alias) and both have the right basename.
+        const step3Basenames = afterStep3.map((e: { path: string }) => path.basename(e.path));
+        expect(step3Basenames).toEqual(['collide-app', 'collide-app']);
+        const step3Paths = new Set(afterStep3.map((e: { path: string }) => e.path));
+        expect(step3Paths.size).toBe(2);
+        // One of the two entries is the original from step 1 — unchanged.
+        expect(afterStep3.map((e: { path: string }) => e.path)).toContain(afterStep1[0].path);
 
-        // Step 4: REGRESSION GUARD for the #955 review-round-2 finding.
-        // Create a THIRD repo with the same basename and try to register
-        // it via `--name shared --skills` — NO --force. This must still
-        // hit the collision guard even though --skills OR's with force at
-        // the pipeline level. If future refactors accidentally re-conflate
-        // pipeline-force and registry-force, this test fails.
+        // Step 4: REGRESSION GUARD for the design decision in review
+        // round 2/3 — pipeline-re-index flags must NOT bypass the
+        // registry collision guard. `--skills` triggers pipeline
+        // re-run (skills generation needs a fresh pipelineResult) but
+        // must leave the registry guard in force. Bypass requires the
+        // explicit --allow-duplicate-name flag.
         const repoC = makeMiniRepoCopy('collide-app', 'gn-collide-c-');
         const parentC = path.dirname(repoC);
         try {
@@ -315,6 +328,8 @@ describe('CLI end-to-end', () => {
           expect(r4.status).toBe(1);
           const r4Output = `${r4.stdout}${r4.stderr}`;
           expect(r4Output).toMatch(/Registry name collision|already used/i);
+          // The error hint should point at the new flag.
+          expect(r4Output).toMatch(/--allow-duplicate-name/);
 
           // Registry unchanged — still only A + B under "shared".
           const afterStep4 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
