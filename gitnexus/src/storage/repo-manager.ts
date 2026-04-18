@@ -257,11 +257,21 @@ export interface RegisterRepoOptions {
    */
   name?: string;
   /**
-   * Allow registration even when another path already uses this name
-   * (#829). Mapped from the `--allow-duplicate-name` CLI flag —
-   * intentionally a distinct flag from `--force` (which only triggers
-   * pipeline re-index) because a user accepting a duplicate name should
-   * not be forced to also re-run the full pipeline.
+   * Allow two DIFFERENT repo paths to register under the same alias
+   * (#829). Mapped from the `--allow-duplicate-name` CLI flag.
+   *
+   * Scope: this flag governs cross-path alias sharing only — one repo
+   * path always has exactly one registry entry (and therefore exactly
+   * one alias). Re-analyzing the same path with `--name Y` overwrites
+   * a previous `--name X`; it does NOT create a second entry or a
+   * second alias for the same path (see the upsert-by-resolved-path
+   * logic in {@link registerRepo} and the
+   * `re-registerRepo with a different name overrides the previous
+   * alias` test in `test/unit/repo-manager.test.ts`).
+   *
+   * Distinct from `--force` (which only triggers pipeline re-index);
+   * a user accepting a duplicate alias should not be forced to also
+   * re-run the full pipeline.
    */
   allowDuplicateName?: boolean;
 }
@@ -345,14 +355,14 @@ export const registerRepo = async (
   // list output this PR also ships).
   const explicitName = opts?.name !== undefined || (existing && hasCustomAlias(existing));
   if (explicitName && !opts?.allowDuplicateName) {
-    const collision = entries.find(
+    const collidingEntry = entries.find(
       (e, i) =>
         i !== existingIdx &&
         e.name.toLowerCase() === name.toLowerCase() &&
         path.resolve(e.path) !== resolved,
     );
-    if (collision) {
-      throw new RegistryNameCollisionError(name, collision.path, resolved);
+    if (collidingEntry) {
+      throw new RegistryNameCollisionError(name, collidingEntry.path, resolved);
     }
   }
 
