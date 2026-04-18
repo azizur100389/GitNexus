@@ -209,6 +209,16 @@ describe('CLI end-to-end', () => {
   // the real CLI → runFullAnalysis → registerRepo chain, so the
   // passthrough bug cannot slip back in silently.
   describe('analyze --name <alias> and --force (#829)', () => {
+    // Canonicalize paths for cross-platform equality checks. On macOS
+    // os.tmpdir() returns /var/folders/... but spawnSync child processes
+    // see the symlink-resolved /private/var/folders/... form, so the
+    // registry stores the realpath. On Windows, os.tmpdir() can return
+    // the 8.3 short-name form (C:\Users\RUNNER~1\...) while the spawned
+    // CLI process sees the long form (C:\Users\runneradmin\...).
+    // fs.realpathSync() canonicalizes both so assertions don't break on
+    // platform-specific path quirks.
+    const canonical = (p: string): string => fs.realpathSync(p);
+
     it('--name alias stores; collision rejects; --force bypasses', () => {
       // Isolate the global registry so this test never touches the
       // developer's real ~/.gitnexus.
@@ -241,7 +251,7 @@ describe('CLI end-to-end', () => {
         expect(Array.isArray(afterStep1)).toBe(true);
         expect(afterStep1).toHaveLength(1);
         expect(afterStep1[0].name).toBe('shared');
-        expect(path.resolve(afterStep1[0].path)).toBe(path.resolve(repoA));
+        expect(canonical(afterStep1[0].path)).toBe(canonical(repoA));
 
         // Step 2: analyze repoB with the SAME --name → collision error.
         const r2 = runCliWithEnv(
@@ -259,7 +269,7 @@ describe('CLI end-to-end', () => {
         // silently added, overwritten, or corrupted anything.
         const afterStep2 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
         expect(afterStep2).toHaveLength(1);
-        expect(path.resolve(afterStep2[0].path)).toBe(path.resolve(repoA));
+        expect(canonical(afterStep2[0].path)).toBe(canonical(repoA));
 
         // Step 3: REGRESSION GUARD for the missing --force passthrough bug.
         // Same args as step 2 but with --force → must succeed, and the
@@ -283,8 +293,8 @@ describe('CLI end-to-end', () => {
         const afterStep3 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
         expect(afterStep3).toHaveLength(2);
         expect(afterStep3.every((e: { name: string }) => e.name === 'shared')).toBe(true);
-        const paths = afterStep3.map((e: { path: string }) => path.resolve(e.path)).sort();
-        expect(paths).toEqual([path.resolve(repoA), path.resolve(repoB)].sort());
+        const paths = afterStep3.map((e: { path: string }) => canonical(e.path)).sort();
+        expect(paths).toEqual([canonical(repoA), canonical(repoB)].sort());
 
         // Step 4: REGRESSION GUARD for the #955 review-round-2 finding.
         // Create a THIRD repo with the same basename and try to register
