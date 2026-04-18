@@ -158,15 +158,23 @@ function logQueryError(context: string, err: unknown): void {
 }
 
 /**
- * Structured per-query latency log for production aggregation (#553). The
- * `GitNexus [query:timing] …` prefix makes lines trivially greppable from
- * stdout; the `phases` payload is JSON so log-scraping pipelines can parse
- * it without custom format knowledge.
+ * Structured per-query latency log for production aggregation (#553).
+ *
+ * Emitted on stderr — NOT stdout — because the MCP stdio transport uses
+ * stdout exclusively for JSON-RPC responses (#324), and the CLI e2e test
+ * `tool output goes to stdout via fd 1` asserts that stdout parses cleanly
+ * as JSON. Any `console.log` from inside a tool handler would corrupt the
+ * protocol. Matches the existing `logQueryError` convention above, which
+ * uses stderr for the same reason.
+ *
+ * The `GitNexus [query:timing] …` prefix keeps lines greppable; the
+ * `phases` payload is JSON so log-scraping pipelines can parse it
+ * without custom format knowledge.
  */
 function logQueryTiming(query: string, phases: Record<string, number>): void {
   const totalMs = phases.wall ?? Object.values(phases).reduce((a, b) => a + b, 0);
   const truncated = query.length > 80 ? `${query.slice(0, 80)}…` : query;
-  console.log(
+  console.error(
     `GitNexus [query:timing] query=${JSON.stringify(truncated)} totalMs=${totalMs} phases=${JSON.stringify(phases)}`,
   );
 }
