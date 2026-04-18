@@ -197,12 +197,21 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     const result = await runFullAnalysis(
       repoPath,
       {
+        // Pipeline re-index — OR'd with --skills because skill generation
+        // needs a fresh pipelineResult. This is intentional and has no
+        // bearing on the registry collision guard (see registryForce below).
         force: options?.force || options?.skills,
         embeddings: options?.embeddings,
         skipGit: options?.skipGit,
         skipAgentsMd: options?.skipAgentsMd,
         noStats: options?.noStats,
         registryName: options?.name,
+        // Registry-collision bypass — only the explicit --force flag.
+        // Keeping this separate from `force` above means --skills (and any
+        // future flag that triggers pipeline re-run) does NOT accidentally
+        // bypass the RegistryNameCollisionError guard. See #829 review
+        // round 2.
+        registryForce: options?.force,
       },
       {
         onProgress: (_phase, percent, message) => {

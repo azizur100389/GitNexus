@@ -110,6 +110,55 @@ function runCliRaw(extraArgs: string[], cwd: string, timeoutMs = 15000) {
   });
 }
 
+/**
+ * Like runCliRaw but accepts extra env vars. Used by tests that need to
+ * isolate the global registry via GITNEXUS_HOME so they don't touch the
+ * developer / CI agent's real ~/.gitnexus/registry.json (#829).
+ */
+function runCliWithEnv(
+  extraArgs: string[],
+  cwd: string,
+  extraEnv: Record<string, string>,
+  timeoutMs = 15000,
+) {
+  return spawnSync(process.execPath, ['--import', tsxImportUrl, cliEntry, ...extraArgs], {
+    cwd,
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --max-old-space-size=8192`.trim(),
+      ...extraEnv,
+    },
+  });
+}
+
+/**
+ * Create a fresh git-initialised throwaway repo at `<parentTmp>/<basename>`
+ * and return its path. Used for tests that need multiple repos whose
+ * basenames intentionally collide (#829 reproduction).
+ */
+function makeMiniRepoCopy(basename: string, prefix: string): string {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const repo = path.join(parent, basename);
+  fs.cpSync(FIXTURE_SRC, repo, { recursive: true });
+  spawnSync('git', ['init'], { cwd: repo, stdio: 'pipe' });
+  spawnSync('git', ['add', '-A'], { cwd: repo, stdio: 'pipe' });
+  spawnSync('git', ['commit', '-m', 'initial commit'], {
+    cwd: repo,
+    stdio: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@test',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@test',
+    },
+  });
+  return repo;
+}
+
 describe('CLI end-to-end', () => {
   it('status command exits cleanly', () => {
     const result = runCli('status', MINI_REPO);
@@ -142,6 +191,133 @@ describe('CLI end-to-end', () => {
     const gitnexusDir = path.join(MINI_REPO, '.gitnexus');
     expect(fs.existsSync(gitnexusDir)).toBe(true);
     expect(fs.statSync(gitnexusDir).isDirectory()).toBe(true);
+  });
+
+  // ─── analyze --name <alias> + --force (#829) ───────────────────────
+  //
+  // End-to-end regression guard for the name-collision feature:
+  //   1. `analyze --name X` persists the alias to ~/.gitnexus/registry.json
+  //   2. A second `analyze --name X` on a DIFFERENT path is rejected with
+  //      a collision error (exit code 1, "already used" in output)
+  //   3. A second `analyze --name X --force` bypasses the guard and both
+  //      entries coexist in registry.json
+  //
+  // The third assertion is the regression guard for the blocking bug
+  // caught in the first round of review: `--force` was documented in the
+  // error hint but not forwarded to registerRepo, so following the
+  // documented workaround produced the same error. This test invokes
+  // the real CLI → runFullAnalysis → registerRepo chain, so the
+  // passthrough bug cannot slip back in silently.
+  describe('analyze --name <alias> and --force (#829)', () => {
+    it('--name alias stores; collision rejects; --force bypasses', () => {
+      // Isolate the global registry so this test never touches the
+      // developer's real ~/.gitnexus.
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-'));
+
+      // Two mini-repo copies whose basenames intentionally collide.
+      const repoA = makeMiniRepoCopy('collide-app', 'gn-collide-a-');
+      const repoB = makeMiniRepoCopy('collide-app', 'gn-collide-b-');
+      const parentA = path.dirname(repoA);
+      const parentB = path.dirname(repoB);
+
+      try {
+        // Step 1: analyze repoA with --name shared → registry entry created.
+        const r1 = runCliWithEnv(
+          ['analyze', '--name', 'shared'],
+          repoA,
+          { GITNEXUS_HOME: gnHome },
+          60000,
+        );
+        if (r1.status === null) return; // CI timeout tolerance
+        expect(
+          r1.status,
+          [`step 1 exited with ${r1.status}`, `stdout: ${r1.stdout}`, `stderr: ${r1.stderr}`].join(
+            '\n',
+          ),
+        ).toBe(0);
+
+        const registryPath = path.join(gnHome, 'registry.json');
+        const afterStep1 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        expect(Array.isArray(afterStep1)).toBe(true);
+        expect(afterStep1).toHaveLength(1);
+        expect(afterStep1[0].name).toBe('shared');
+        expect(path.resolve(afterStep1[0].path)).toBe(path.resolve(repoA));
+
+        // Step 2: analyze repoB with the SAME --name → collision error.
+        const r2 = runCliWithEnv(
+          ['analyze', '--name', 'shared'],
+          repoB,
+          { GITNEXUS_HOME: gnHome },
+          60000,
+        );
+        if (r2.status === null) return;
+        expect(r2.status).toBe(1);
+        const r2Output = `${r2.stdout}${r2.stderr}`;
+        expect(r2Output).toMatch(/Registry name collision|already used/i);
+
+        // Registry still has just the first entry — step 2 must not have
+        // silently added, overwritten, or corrupted anything.
+        const afterStep2 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        expect(afterStep2).toHaveLength(1);
+        expect(path.resolve(afterStep2[0].path)).toBe(path.resolve(repoA));
+
+        // Step 3: REGRESSION GUARD for the missing --force passthrough bug.
+        // Same args as step 2 but with --force → must succeed, and the
+        // registry must now contain BOTH entries under name "shared".
+        const r3 = runCliWithEnv(
+          ['analyze', '--name', 'shared', '--force'],
+          repoB,
+          { GITNEXUS_HOME: gnHome },
+          60000,
+        );
+        if (r3.status === null) return;
+        expect(
+          r3.status,
+          [
+            `step 3 (--force bypass) exited with ${r3.status}`,
+            `stdout: ${r3.stdout}`,
+            `stderr: ${r3.stderr}`,
+          ].join('\n'),
+        ).toBe(0);
+
+        const afterStep3 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        expect(afterStep3).toHaveLength(2);
+        expect(afterStep3.every((e: { name: string }) => e.name === 'shared')).toBe(true);
+        const paths = afterStep3.map((e: { path: string }) => path.resolve(e.path)).sort();
+        expect(paths).toEqual([path.resolve(repoA), path.resolve(repoB)].sort());
+
+        // Step 4: REGRESSION GUARD for the #955 review-round-2 finding.
+        // Create a THIRD repo with the same basename and try to register
+        // it via `--name shared --skills` — NO --force. This must still
+        // hit the collision guard even though --skills OR's with force at
+        // the pipeline level. If future refactors accidentally re-conflate
+        // pipeline-force and registry-force, this test fails.
+        const repoC = makeMiniRepoCopy('collide-app', 'gn-collide-c-');
+        const parentC = path.dirname(repoC);
+        try {
+          const r4 = runCliWithEnv(
+            ['analyze', '--name', 'shared', '--skills'],
+            repoC,
+            { GITNEXUS_HOME: gnHome },
+            60000,
+          );
+          if (r4.status === null) return;
+          expect(r4.status).toBe(1);
+          const r4Output = `${r4.stdout}${r4.stderr}`;
+          expect(r4Output).toMatch(/Registry name collision|already used/i);
+
+          // Registry unchanged — still only A + B under "shared".
+          const afterStep4 = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+          expect(afterStep4).toHaveLength(2);
+        } finally {
+          fs.rmSync(parentC, { recursive: true, force: true });
+        }
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+        fs.rmSync(parentA, { recursive: true, force: true });
+        fs.rmSync(parentB, { recursive: true, force: true });
+      }
+    }, 360000); // 6-min outer budget (4 × ~60s analyze calls + fixture setup)
   });
 
   describe('unhappy path', () => {

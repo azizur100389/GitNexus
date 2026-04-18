@@ -46,6 +46,12 @@ export interface AnalyzeCallbacks {
 }
 
 export interface AnalyzeOptions {
+  /**
+   * Force a full re-index of the pipeline. Callers may OR this with
+   * other flags that imply re-analysis (e.g. `--skills`), so the value
+   * here is the PIPELINE-force signal, NOT the registry-collision
+   * bypass. See `registryForce` below.
+   */
   force?: boolean;
   embeddings?: boolean;
   skipGit?: boolean;
@@ -59,6 +65,16 @@ export interface AnalyzeOptions {
    * this alias instead of the path-derived basename.
    */
   registryName?: string;
+  /**
+   * Bypass the `RegistryNameCollisionError` guard and allow two paths
+   * to register under the same `name` (#829). Semantically distinct
+   * from `force` above — the pipeline may be force-re-indexed for
+   * many reasons (`--skills`, future flags), but registry-collision
+   * bypass requires the user to have explicitly passed `--force`.
+   * Conflating the two (as an earlier draft of this feature did)
+   * meant `--skills` silently bypassed the collision guard.
+   */
+  registryForce?: boolean;
 }
 
 export interface AnalyzeResult {
@@ -319,14 +335,17 @@ export async function runFullAnalysis(
       },
     };
     await saveMeta(storagePath, meta);
-    // Forward both `name` (the --name alias) and `force` (bypass the
-    // name-collision guard when the user explicitly opts in). The error
-    // message in analyze.ts instructs the user to re-run with --force,
-    // so the flag MUST reach registerRepo or the documented workaround
-    // would hit the same error again (#829 review feedback).
+    // Forward the --name alias AND the registry-specific force bit.
+    // Note: `options.registryForce` is distinct from `options.force`
+    // (the pipeline re-index signal). The CLI only sets registryForce
+    // when the user explicitly passes --force; --skills (which sets
+    // force for pipeline re-analysis) does NOT set registryForce, so
+    // --name + --skills without --force correctly hits the collision
+    // guard. See #829 review round 2 for the --skills bypass regression
+    // this split prevents.
     await registerRepo(repoPath, meta, {
       name: options.registryName,
-      force: options.force,
+      force: options.registryForce,
     });
 
     // Only attempt to update .gitignore when a .git directory is present.
