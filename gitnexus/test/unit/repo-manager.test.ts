@@ -216,7 +216,11 @@ describe('registerRepo name override + collision guard (#829)', () => {
     } catch (e) {
       expect(e).toBeInstanceOf(RegistryNameCollisionError);
       const err = e as RegistryNameCollisionError;
-      expect(err.name).toBe('shared');
+      // err.registryName carries the colliding alias (exposed as its own
+      // field so err.name retains the inherited Error.prototype.name
+      // semantics for downstream `err.name === '…Error'` checks).
+      expect(err.registryName).toBe('shared');
+      expect(err.name).toBe('RegistryNameCollisionError');
       expect(path.resolve(err.existingPath)).toBe(path.resolve(tmpRepoA.dbPath));
       expect(path.resolve(err.requestedPath)).toBe(path.resolve(tmpRepoB.dbPath));
     }

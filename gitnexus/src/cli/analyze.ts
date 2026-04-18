@@ -315,11 +315,11 @@ export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOption
     // actionable error rather than a generic stack-trace.
     if (err instanceof RegistryNameCollisionError) {
       console.error(`\n  Registry name collision:\n`);
-      console.error(`    "${err.name}" is already used by "${err.existingPath}".\n`);
+      console.error(`    "${err.registryName}" is already used by "${err.existingPath}".\n`);
       console.error(`  Options:`);
       console.error(`    • Pick a different alias:  gitnexus analyze --name <alias>`);
       console.error(
-        `    • Force the duplicate:     gitnexus analyze --force  (leaves "-r ${err.name}" ambiguous)`,
+        `    • Force the duplicate:     gitnexus analyze --force  (leaves "-r ${err.registryName}" ambiguous)`,
       );
       console.error('');
       process.exitCode = 1;

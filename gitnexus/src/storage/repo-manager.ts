@@ -268,20 +268,26 @@ export interface RegisterRepoOptions {
  * Thrown by {@link registerRepo} when a requested name is already in
  * use by a DIFFERENT path. The CLI layer surfaces this as an actionable
  * error instead of relying on `.message` string-matching.
+ *
+ * The colliding alias is exposed as `err.registryName` (not `err.name`).
+ * `err.name` keeps its inherited `Error.prototype.name` semantics (the
+ * class name) so downstream code can do the usual `err.name ===
+ * 'RegistryNameCollisionError'` checks; use the `kind` discriminant or
+ * `instanceof RegistryNameCollisionError` for type-safe narrowing.
  */
 export class RegistryNameCollisionError extends Error {
   readonly kind = 'RegistryNameCollisionError' as const;
   constructor(
-    public readonly name: string,
+    public readonly registryName: string,
     public readonly existingPath: string,
     public readonly requestedPath: string,
   ) {
     super(
-      `Registry name "${name}" is already used by "${existingPath}".\n` +
+      `Registry name "${registryName}" is already used by "${existingPath}".\n` +
         `Pass --name <alias> to register "${requestedPath}" under a different name, ` +
         `or --force to allow both paths under the same name (leaves -r <name> ambiguous for these two).`,
     );
-    this.name = name;
+    this.name = 'RegistryNameCollisionError';
   }
 }
 

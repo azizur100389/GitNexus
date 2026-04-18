@@ -319,7 +319,15 @@ export async function runFullAnalysis(
       },
     };
     await saveMeta(storagePath, meta);
-    await registerRepo(repoPath, meta, { name: options.registryName });
+    // Forward both `name` (the --name alias) and `force` (bypass the
+    // name-collision guard when the user explicitly opts in). The error
+    // message in analyze.ts instructs the user to re-run with --force,
+    // so the flag MUST reach registerRepo or the documented workaround
+    // would hit the same error again (#829 review feedback).
+    await registerRepo(repoPath, meta, {
+      name: options.registryName,
+      force: options.force,
+    });
 
     // Only attempt to update .gitignore when a .git directory is present.
     if (hasGitDir(repoPath)) {
