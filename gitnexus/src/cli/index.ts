@@ -44,10 +44,19 @@ program
       'Mirrors `clean --all`. Cannot be combined with [path], --name, or --allow-duplicate-name. ' +
       'Skips entries whose path no longer exists on disk; failures in one repo do not halt the batch.',
   )
+  .option(
+    '--no-throttle',
+    'With --all only: disable the resource-aware pause between repos ' +
+      '(default pauses when CPU > 80% or memory > 85%). Intended for dedicated ' +
+      'CI / build agents that accept the full cost.',
+  )
   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
   .addHelpText(
     'after',
-    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)',
+    '\nEnvironment variables:\n' +
+      '  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n' +
+      '  GITNEXUS_THROTTLE_CPU     With --all: CPU %% threshold above which we pause (default 80)\n' +
+      '  GITNEXUS_THROTTLE_MEM     With --all: memory %% threshold above which we pause (default 85)',
   )
   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 

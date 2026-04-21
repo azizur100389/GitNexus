@@ -933,6 +933,48 @@ describe('CLI end-to-end', () => {
         fs.rmSync(parentGone, { recursive: true, force: true });
       }
     }, 300000); // 5-min budget (2 × ~60s seed + 1 × ~60s re-index + overhead)
+
+    it('accepts --no-throttle and completes without the resource wait, even at a pathologically low CPU threshold', () => {
+      // Regression guard for the #1010 review safeguard. Setting the
+      // CPU threshold to the minimum valid value (1%) means the
+      // throttle WOULD trigger on any machine running this test,
+      // because real CPU is never at 0%. Without --no-throttle, the
+      // test would hang until the 3-min vitest timeout — verifying
+      // that --no-throttle actually bypasses the check.
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-nothrottle-'));
+      const repo = makeMiniRepoCopy('nothrottle', 'gn-nothrottle-');
+      const parent = path.dirname(repo);
+
+      try {
+        const seed = runCliWithEnv(['analyze'], repo, { GITNEXUS_HOME: gnHome }, 60000);
+        if (seed.status === null) return;
+        expect(seed.status).toBe(0);
+
+        // Threshold of 1% makes the throttle fire every poll on any
+        // realistic machine. With --no-throttle the entire polling
+        // loop is skipped, so the batch completes in normal time.
+        const r = runCliWithEnv(
+          ['analyze', '--all', '--no-throttle', '--force'],
+          parent,
+          {
+            GITNEXUS_HOME: gnHome,
+            GITNEXUS_THROTTLE_CPU: '1',
+            GITNEXUS_THROTTLE_MEM: '1',
+          },
+          180000,
+        );
+        if (r.status === null) return;
+        expect(r.status, `--no-throttle --all exited ${r.status}: ${r.stdout}${r.stderr}`).toBe(0);
+        const output = `${r.stdout}${r.stderr}`;
+        // Throttle messaging must be ABSENT — that's the whole point.
+        expect(output, 'no-throttle must skip the pause messaging').not.toMatch(/Throttling/i);
+        // Summary must still report the standard batch shape.
+        expect(output).toMatch(/1 succeeded/i);
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+        fs.rmSync(parent, { recursive: true, force: true });
+      }
+    }, 300000); // 5-min budget (1 × ~60s seed + 1 × ~60s re-index + overhead)
   });
 
   describe('unhappy path', () => {
