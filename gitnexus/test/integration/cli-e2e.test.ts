@@ -934,15 +934,19 @@ describe('CLI end-to-end', () => {
       }
     }, 300000); // 5-min budget (2 × ~60s seed + 1 × ~60s re-index + overhead)
 
-    it('accepts --no-throttle and completes without the resource wait, even at a pathologically low CPU threshold', () => {
-      // Regression guard for the #1010 review safeguard. Setting the
-      // CPU threshold to the minimum valid value (1%) means the
-      // throttle WOULD trigger on any machine running this test,
-      // because real CPU is never at 0%. Without --no-throttle, the
-      // test would hang until the 3-min vitest timeout — verifying
-      // that --no-throttle actually bypasses the check.
-      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-nothrottle-'));
-      const repo = makeMiniRepoCopy('nothrottle', 'gn-nothrottle-');
+    it('prints a resource-overuse warning when GITNEXUS_THROTTLE_* env vars are set above 90%', () => {
+      // Per #1010 review round 2 — @magyargergo asked for "a warning on
+      // overusing resources" when operators tune the thresholds past
+      // the point where the safeguard still meaningfully protects. We
+      // exercise the warning path end-to-end: set CPU threshold = 95%
+      // (at which point the safeguard barely engages), seed a single
+      // repo, then run --all and assert that the batch (1) prints the
+      // warning banner at start and (2) still completes normally.
+      // Keeping mem = default so only one threshold triggers — that
+      // way the warning listing includes exactly the risky one, which
+      // we also assert.
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-throttle-warn-'));
+      const repo = makeMiniRepoCopy('throttle-warn', 'gn-throttle-warn-');
       const parent = path.dirname(repo);
 
       try {
@@ -950,25 +954,28 @@ describe('CLI end-to-end', () => {
         if (seed.status === null) return;
         expect(seed.status).toBe(0);
 
-        // Threshold of 1% makes the throttle fire every poll on any
-        // realistic machine. With --no-throttle the entire polling
-        // loop is skipped, so the batch completes in normal time.
         const r = runCliWithEnv(
-          ['analyze', '--all', '--no-throttle', '--force'],
+          ['analyze', '--all', '--force'],
           parent,
           {
             GITNEXUS_HOME: gnHome,
-            GITNEXUS_THROTTLE_CPU: '1',
-            GITNEXUS_THROTTLE_MEM: '1',
+            GITNEXUS_THROTTLE_CPU: '95',
+            // GITNEXUS_THROTTLE_MEM left unset (default 85) so only
+            // CPU triggers the warning — lets us assert specificity.
           },
           180000,
         );
         if (r.status === null) return;
-        expect(r.status, `--no-throttle --all exited ${r.status}: ${r.stdout}${r.stderr}`).toBe(0);
+        expect(r.status, `--all exited ${r.status}: ${r.stdout}${r.stderr}`).toBe(0);
+
         const output = `${r.stdout}${r.stderr}`;
-        // Throttle messaging must be ABSENT — that's the whole point.
-        expect(output, 'no-throttle must skip the pause messaging').not.toMatch(/Throttling/i);
-        // Summary must still report the standard batch shape.
+        expect(output, 'env-var tuning above 90% must trigger the overuse warning').toMatch(
+          /Resource-throttle thresholds are set high/i,
+        );
+        expect(output).toMatch(/CPU=95%/);
+        // Memory threshold left at default 85% — must NOT be flagged.
+        expect(output, 'memory at default must not appear in warning').not.toMatch(/memory=/);
+        // Batch still completes — the warning is informational, not a gate.
         expect(output).toMatch(/1 succeeded/i);
       } finally {
         fs.rmSync(gnHome, { recursive: true, force: true });

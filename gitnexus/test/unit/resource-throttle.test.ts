@@ -16,13 +16,16 @@
  *   - env-var overrides parse correctly (with fallback on invalid)
  */
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import {
   DEFAULT_CPU_THRESHOLD_PCT,
   DEFAULT_MEM_THRESHOLD_PCT,
+  THRESHOLD_RISK_WARNING_PCT,
+  areThresholdsRisky,
   readThresholdsFromEnv,
   shouldThrottle,
   waitForResourceAvailability,
+  warnIfThresholdsRisky,
   type MetricsProvider,
   type ResourceSnapshot,
   type ThrottleThresholds,
@@ -237,5 +240,107 @@ describe('readThresholdsFromEnv', () => {
     const t = readThresholdsFromEnv();
     expect(t.cpuPct).toBe(82.5);
     expect(t.memPct).toBe(93.2);
+  });
+});
+
+// ─── areThresholdsRisky / warnIfThresholdsRisky ──────────────────────
+//
+// Post-#1010 review round 2: @magyargergo removed the `--no-throttle`
+// bypass and asked for "a warning on overusing resources" when env
+// vars are tuned past the point where the safeguard still meaningfully
+// protects. The boundary is THRESHOLD_RISK_WARNING_PCT = 90%.
+
+describe('areThresholdsRisky', () => {
+  it('returns false for the shipped defaults (80 / 85)', () => {
+    expect(
+      areThresholdsRisky({
+        cpuPct: DEFAULT_CPU_THRESHOLD_PCT,
+        memPct: DEFAULT_MEM_THRESHOLD_PCT,
+      }),
+    ).toBe(false);
+  });
+
+  it('returns true when CPU alone is at or above the warning boundary (>= 90)', () => {
+    expect(areThresholdsRisky({ cpuPct: 90, memPct: 50 })).toBe(true);
+    expect(areThresholdsRisky({ cpuPct: 99, memPct: 50 })).toBe(true);
+  });
+
+  it('returns true when memory alone is at or above the warning boundary', () => {
+    expect(areThresholdsRisky({ cpuPct: 50, memPct: 90 })).toBe(true);
+    expect(areThresholdsRisky({ cpuPct: 50, memPct: 95 })).toBe(true);
+  });
+
+  it('returns true when both are risky', () => {
+    expect(areThresholdsRisky({ cpuPct: 95, memPct: 95 })).toBe(true);
+  });
+
+  it('returns false at exactly one below the boundary (89.9)', () => {
+    // The boundary is INCLUSIVE (>= 90 is risky). 89.9 is the last
+    // safe tick for CPU; mem left at default.
+    expect(areThresholdsRisky({ cpuPct: 89.9, memPct: DEFAULT_MEM_THRESHOLD_PCT })).toBe(false);
+  });
+
+  it('the warning boundary constant matches the documented 90%', () => {
+    // Locks in the doc contract — the help text and JSDoc both say
+    // "raised above 90%", so this constant must reflect that.
+    expect(THRESHOLD_RISK_WARNING_PCT).toBe(90);
+  });
+});
+
+describe('warnIfThresholdsRisky', () => {
+  it('no-ops when thresholds are at defaults', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      warnIfThresholdsRisky({
+        cpuPct: DEFAULT_CPU_THRESHOLD_PCT,
+        memPct: DEFAULT_MEM_THRESHOLD_PCT,
+      });
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('emits a warning naming CPU when only CPU is risky', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      warnIfThresholdsRisky({ cpuPct: 95, memPct: DEFAULT_MEM_THRESHOLD_PCT });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = warn.mock.calls[0][0] as string;
+      expect(msg).toContain('CPU=95%');
+      // Mem at default must NOT be in the warning — specificity matters.
+      expect(msg).not.toContain('memory=');
+      // Always suggests the defaults in the remediation text.
+      expect(msg).toMatch(/GITNEXUS_THROTTLE_CPU/);
+      expect(msg).toMatch(/80 \/ 85/);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('emits a warning naming memory when only memory is risky', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      warnIfThresholdsRisky({ cpuPct: DEFAULT_CPU_THRESHOLD_PCT, memPct: 92 });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = warn.mock.calls[0][0] as string;
+      expect(msg).toContain('memory=92%');
+      expect(msg).not.toContain('CPU=');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('emits a single warning listing both when both are risky', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      warnIfThresholdsRisky({ cpuPct: 91, memPct: 95 });
+      expect(warn).toHaveBeenCalledTimes(1);
+      const msg = warn.mock.calls[0][0] as string;
+      expect(msg).toContain('CPU=91%');
+      expect(msg).toContain('memory=95%');
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

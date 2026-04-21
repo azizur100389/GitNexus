@@ -21,7 +21,11 @@ import {
 } from '../storage/repo-manager.js';
 import { getGitRoot, hasGitDir } from '../storage/git.js';
 import { runFullAnalysis } from '../core/run-analyze.js';
-import { readThresholdsFromEnv, waitForResourceAvailability } from './resource-throttle.js';
+import {
+  readThresholdsFromEnv,
+  waitForResourceAvailability,
+  warnIfThresholdsRisky,
+} from './resource-throttle.js';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 
@@ -91,20 +95,6 @@ export interface AnalyzeOptions {
    * proceed untouched. Same per-repo error tolerance as `clean --all`.
    */
   all?: boolean;
-  /**
-   * Resource-aware throttle toggle for `--all` iterations (#1010 review).
-   * Commander stores the CLI `--no-throttle` flag as `throttle: false`
-   * (the `--no-` prefix is the commander convention for a negatable
-   * boolean default-true option); omitting the flag leaves `throttle`
-   * unset / true.
-   *
-   * Behaviour: by default, before each child spawn we poll CPU + memory
-   * and wait while the system is above threshold (80% / 85%, tunable
-   * via GITNEXUS_THROTTLE_CPU / GITNEXUS_THROTTLE_MEM). Pass
-   * `--no-throttle` on dedicated CI / build agents where you've already
-   * accepted the resource cost and want the batch to run flat-out.
-   */
-  throttle?: boolean;
 }
 
 /**
@@ -168,12 +158,14 @@ const analyzeAllBranch = async (options: AnalyzeOptions | undefined): Promise<vo
 
   // Resource-aware throttle config (#1010 review — @magyargergo).
   // Defaults match the reviewer's sketch (80% CPU / 85% mem); env vars
-  // let operators tune without code changes. `--no-throttle` disables
-  // the check entirely for CI / build agents that accept the full cost
-  // (commander stores the negated flag as `throttle: false`; absence
-  // of the flag leaves `throttle` undefined, which we treat as enabled).
+  // let operators tune without code changes. Non-bypassable by design —
+  // per review round 2, `--all` must not ship an agent-accessible
+  // override because "resource exhaustion comes with a great cost". If
+  // an operator configures thresholds so high that the safeguard is
+  // effectively disabled, we surface a one-time warning at batch start
+  // ("warning on overusing resources") rather than a silent bypass.
   const throttleThresholds = readThresholdsFromEnv();
-  const throttleEnabled = options?.throttle !== false;
+  warnIfThresholdsRisky(throttleThresholds);
 
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
@@ -181,24 +173,22 @@ const analyzeAllBranch = async (options: AnalyzeOptions | undefined): Promise<vo
     // Pace the batch to host headroom BEFORE announcing the repo. That
     // way the "[i/N] Analyzing" heading always reflects work that is
     // actually starting, not a repo queued behind a throttle wait.
-    if (throttleEnabled) {
-      await waitForResourceAvailability({
-        thresholds: throttleThresholds,
-        onThrottling: (snapshot) => {
-          console.warn(
-            `  ⏸ Throttling — CPU ${snapshot.cpuPct.toFixed(1)}% / mem ${snapshot.memPct.toFixed(
-              1,
-            )}% (thresholds ${throttleThresholds.cpuPct}% / ${throttleThresholds.memPct}%) — ` +
-              `waiting before [${i + 1}/${entries.length}]...`,
-          );
-        },
-        onResumed: (snapshot) => {
-          console.log(
-            `  ▶ Resuming — CPU ${snapshot.cpuPct.toFixed(1)}% / mem ${snapshot.memPct.toFixed(1)}%`,
-          );
-        },
-      });
-    }
+    await waitForResourceAvailability({
+      thresholds: throttleThresholds,
+      onThrottling: (snapshot) => {
+        console.warn(
+          `  ⏸ Throttling — CPU ${snapshot.cpuPct.toFixed(1)}% / mem ${snapshot.memPct.toFixed(
+            1,
+          )}% (thresholds ${throttleThresholds.cpuPct}% / ${throttleThresholds.memPct}%) — ` +
+            `waiting before [${i + 1}/${entries.length}]...`,
+        );
+      },
+      onResumed: (snapshot) => {
+        console.log(
+          `  ▶ Resuming — CPU ${snapshot.cpuPct.toFixed(1)}% / mem ${snapshot.memPct.toFixed(1)}%`,
+        );
+      },
+    });
 
     console.log(`\n  [${i + 1}/${entries.length}] Analyzing: ${entry.name} (${entry.path})`);
 

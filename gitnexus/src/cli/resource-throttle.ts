@@ -28,6 +28,17 @@ export const DEFAULT_CPU_THRESHOLD_PCT = 80;
 export const DEFAULT_MEM_THRESHOLD_PCT = 85;
 const DEFAULT_POLL_INTERVAL_MS = 1000;
 
+/**
+ * Threshold above which the operator is considered to have effectively
+ * neutered the safeguard (#1010 review round 2 — @magyargergo:
+ * "I'd put a warning on overusing resources"). Set to 90% — a machine
+ * saturated above this is already on the edge of thermal / memory
+ * pressure, so a throttle that only engages past here is mostly a
+ * formality. Values from 0–90 are normal tuning; 90–100 prints a
+ * one-time warning.
+ */
+export const THRESHOLD_RISK_WARNING_PCT = 90;
+
 export interface ThrottleThresholds {
   /** Throttle when CPU usage exceeds this percentage (0–100). */
   cpuPct: number;
@@ -65,6 +76,42 @@ export const shouldThrottle = (
   thresholds: ThrottleThresholds,
 ): boolean => {
   return cpuPct > thresholds.cpuPct || memPct > thresholds.memPct;
+};
+
+/**
+ * Returns true when at least one threshold is at or above
+ * {@link THRESHOLD_RISK_WARNING_PCT} — a signal that the operator has
+ * tuned the env vars so aggressively that the safeguard is mostly
+ * cosmetic. Pure predicate; the CLI layer decides how to surface the
+ * warning.
+ */
+export const areThresholdsRisky = (thresholds: ThrottleThresholds): boolean => {
+  return (
+    thresholds.cpuPct >= THRESHOLD_RISK_WARNING_PCT ||
+    thresholds.memPct >= THRESHOLD_RISK_WARNING_PCT
+  );
+};
+
+/**
+ * If either env-tuned threshold is risky, print a one-time warning to
+ * stderr naming which metric and the configured value. Called once at
+ * the start of `analyze --all`; no-op if defaults are in use.
+ */
+export const warnIfThresholdsRisky = (thresholds: ThrottleThresholds): void => {
+  if (!areThresholdsRisky(thresholds)) return;
+  const risky: string[] = [];
+  if (thresholds.cpuPct >= THRESHOLD_RISK_WARNING_PCT) {
+    risky.push(`CPU=${thresholds.cpuPct}%`);
+  }
+  if (thresholds.memPct >= THRESHOLD_RISK_WARNING_PCT) {
+    risky.push(`memory=${thresholds.memPct}%`);
+  }
+  console.warn(
+    `  ⚠ Resource-throttle thresholds are set high (${risky.join(', ')}). ` +
+      `At these levels the safeguard barely engages — your machine may thermal-throttle ` +
+      `or OOM before analyze --all pauses. Consider leaving GITNEXUS_THROTTLE_CPU / ` +
+      `GITNEXUS_THROTTLE_MEM at their defaults (80 / 85).`,
+  );
 };
 
 /** Snapshot of one metrics poll. Shape matches what we derive from the
