@@ -38,6 +38,12 @@ program
     'Register this repo even if another path already uses the same --name alias. ' +
       'Leaves `-r <name>` ambiguous for the two paths; use -r <path> to disambiguate.',
   )
+  .option(
+    '--all',
+    'Re-index every repo registered in ~/.gitnexus/registry.json. ' +
+      'Mirrors `clean --all`. Cannot be combined with [path], --name, or --allow-duplicate-name. ' +
+      'Skips entries whose path no longer exists on disk; failures in one repo do not halt the batch.',
+  )
   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
   .addHelpText(
     'after',

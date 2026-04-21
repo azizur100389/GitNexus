@@ -749,6 +749,192 @@ describe('CLI end-to-end', () => {
     }, 240000); // 4-min budget (2 × ~60s analyze + 1 × fast clean --all)
   });
 
+  // ─── analyze --all: batch re-index every registered repo (#253) ──
+  //
+  // `analyze --all` iterates ~/.gitnexus/registry.json and spawns a
+  // child `gitnexus analyze <path>` for each entry. Child-process
+  // isolation means one bad repo doesn't halt the batch. We verify:
+  //   1. Happy path — two registered repos both get re-indexed
+  //      (indexedAt bumped), summary reports "2 succeeded".
+  //   2. Empty registry — friendly message, exit 0, no spawn.
+  //   3. Mutual exclusion vs [path] / --name — exit 1 with clear
+  //      error BEFORE any child spawn or registry read.
+  //   4. Missing-path tolerance — an entry whose repo was deleted on
+  //      disk is skipped with a warning; sibling valid entries still
+  //      re-index; summary reports the skip.
+  describe('analyze --all (#253)', () => {
+    it('re-indexes every registered repo and reports a summary', () => {
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-all-'));
+      const repoA = makeMiniRepoCopy('all-a', 'gn-all-a-');
+      const repoB = makeMiniRepoCopy('all-b', 'gn-all-b-');
+      const parentA = path.dirname(repoA);
+      const parentB = path.dirname(repoB);
+
+      try {
+        // Seed the registry with two entries.
+        for (const repo of [repoA, repoB]) {
+          const r = runCliWithEnv(['analyze'], repo, { GITNEXUS_HOME: gnHome }, 60000);
+          if (r.status === null) return;
+          expect(r.status, `seed analyze exited ${r.status}: ${r.stdout}${r.stderr}`).toBe(0);
+        }
+
+        const registryPath = path.join(gnHome, 'registry.json');
+        const seed = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        expect(seed).toHaveLength(2);
+        const seedIndexedAt = seed.map((e: { indexedAt: string }) => e.indexedAt).sort();
+
+        // Wait 1.1s so indexedAt (ISO second precision) changes. Lets
+        // us prove the re-index actually re-wrote the entries.
+        const waitUntil = Date.now() + 1100;
+        while (Date.now() < waitUntil) {
+          /* spin */
+        }
+
+        // Run --all --force to re-index both.
+        const r = runCliWithEnv(
+          ['analyze', '--all', '--force'],
+          parentA,
+          { GITNEXUS_HOME: gnHome },
+          180000,
+        );
+        if (r.status === null) return;
+        expect(r.status, `--all exited ${r.status}: ${r.stdout}${r.stderr}`).toBe(0);
+
+        const output = `${r.stdout}${r.stderr}`;
+        // Summary line — structural assertion, not a brittle regex on
+        // the exact whitespace.
+        expect(output).toMatch(/2 succeeded/i);
+        expect(output).toMatch(/0 skipped/i);
+        expect(output).toMatch(/0 failed/i);
+        // Per-repo heading shape: [i/N] Analyzing: <name> (<path>)
+        expect(output).toMatch(/\[1\/2\] Analyzing:/);
+        expect(output).toMatch(/\[2\/2\] Analyzing:/);
+
+        // Both entries' indexedAt must have advanced vs the seed.
+        const after = JSON.parse(fs.readFileSync(registryPath, 'utf-8'));
+        expect(after).toHaveLength(2);
+        const afterIndexedAt = after.map((e: { indexedAt: string }) => e.indexedAt).sort();
+        for (let i = 0; i < 2; i++) {
+          expect(
+            new Date(afterIndexedAt[i]).getTime(),
+            `entry ${i} indexedAt should advance (was ${seedIndexedAt[i]}, now ${afterIndexedAt[i]})`,
+          ).toBeGreaterThan(new Date(seedIndexedAt[i]).getTime());
+        }
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+        fs.rmSync(parentA, { recursive: true, force: true });
+        fs.rmSync(parentB, { recursive: true, force: true });
+      }
+    }, 420000); // 7-min budget (2 × ~60s seed + 2 × ~60s re-index + overhead)
+
+    it('shows a friendly message and exits 0 when registry is empty', () => {
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-all-empty-'));
+      try {
+        const r = runCliWithEnv(
+          ['analyze', '--all'],
+          os.tmpdir(),
+          { GITNEXUS_HOME: gnHome },
+          15000,
+        );
+        if (r.status === null) return;
+        expect(r.status).toBe(0);
+        expect(`${r.stdout}${r.stderr}`).toMatch(/No indexed repositories/i);
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('rejects --all combined with explicit [path] argument', () => {
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-all-xp-'));
+      try {
+        // The mutual-exclusion check must fire BEFORE any filesystem
+        // or registry work happens — so we can pass a bogus path and
+        // still expect exit 1 with the error hint.
+        const r = runCliWithEnv(
+          ['analyze', '--all', '/tmp/bogus-path-that-does-not-exist'],
+          os.tmpdir(),
+          { GITNEXUS_HOME: gnHome },
+          15000,
+        );
+        if (r.status === null) return;
+        expect(r.status).toBe(1);
+        const output = `${r.stdout}${r.stderr}`;
+        expect(output).toMatch(/--all cannot be combined with/i);
+        expect(output).toMatch(/\[path\]/);
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('rejects --all combined with --name <alias>', () => {
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-all-xn-'));
+      try {
+        const r = runCliWithEnv(
+          ['analyze', '--all', '--name', 'anything'],
+          os.tmpdir(),
+          { GITNEXUS_HOME: gnHome },
+          15000,
+        );
+        if (r.status === null) return;
+        expect(r.status).toBe(1);
+        const output = `${r.stdout}${r.stderr}`;
+        expect(output).toMatch(/--all cannot be combined with/i);
+        expect(output).toMatch(/--name/);
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('tolerates a registry entry whose repo path was deleted on disk', () => {
+      const gnHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-home-all-missing-'));
+      const repoKeep = makeMiniRepoCopy('all-keep', 'gn-all-keep-');
+      const repoGone = makeMiniRepoCopy('all-gone', 'gn-all-gone-');
+      const parentKeep = path.dirname(repoKeep);
+      const parentGone = path.dirname(repoGone);
+
+      try {
+        // Seed the registry with both repos.
+        for (const repo of [repoKeep, repoGone]) {
+          const r = runCliWithEnv(['analyze'], repo, { GITNEXUS_HOME: gnHome }, 60000);
+          if (r.status === null) return;
+          expect(r.status).toBe(0);
+        }
+        const registryPath = path.join(gnHome, 'registry.json');
+        expect(JSON.parse(fs.readFileSync(registryPath, 'utf-8'))).toHaveLength(2);
+
+        // Delete one of the repo's working trees — leaving the
+        // registry entry pointing at a path that no longer exists.
+        // Simulates the common "user rm -rf'd a project then ran
+        // analyze --all" case.
+        fs.rmSync(repoGone, { recursive: true, force: true });
+        expect(fs.existsSync(repoGone)).toBe(false);
+
+        const r = runCliWithEnv(
+          ['analyze', '--all', '--force'],
+          parentKeep,
+          { GITNEXUS_HOME: gnHome },
+          180000,
+        );
+        if (r.status === null) return;
+        // Summary: 1 succeeded, 1 skipped (the deleted one), 0 failed.
+        // Exit 0 because skipped entries are not failures.
+        expect(r.status).toBe(0);
+        const output = `${r.stdout}${r.stderr}`;
+        expect(output).toMatch(/1 succeeded/i);
+        expect(output).toMatch(/1 skipped/i);
+        expect(output).toMatch(/0 failed/i);
+        expect(output).toMatch(/path no longer exists/i);
+
+        // The keep-repo's .gitnexus must still be intact.
+        expect(fs.existsSync(path.join(repoKeep, '.gitnexus'))).toBe(true);
+      } finally {
+        fs.rmSync(gnHome, { recursive: true, force: true });
+        fs.rmSync(parentKeep, { recursive: true, force: true });
+        fs.rmSync(parentGone, { recursive: true, force: true });
+      }
+    }, 300000); // 5-min budget (2 × ~60s seed + 1 × ~60s re-index + overhead)
+  });
+
   describe('unhappy path', () => {
     it('exits with error when no command is given', () => {
       const result = runCliRaw([], MINI_REPO);

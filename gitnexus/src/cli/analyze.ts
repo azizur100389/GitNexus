@@ -9,18 +9,20 @@
  */
 
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import v8 from 'v8';
 import cliProgress from 'cli-progress';
 import { closeLbug } from '../core/lbug/lbug-adapter.js';
 import {
   getStoragePaths,
   getGlobalRegistryPath,
+  listRegisteredRepos,
   RegistryNameCollisionError,
 } from '../storage/repo-manager.js';
 import { getGitRoot, hasGitDir } from '../storage/git.js';
 import { runFullAnalysis } from '../core/run-analyze.js';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 
 const HEAP_MB = 8192;
 const HEAP_FLAG = `--max-old-space-size=${HEAP_MB}`;
@@ -78,13 +80,174 @@ export interface AnalyzeOptions {
    * `allowDuplicateName` option end-to-end.
    */
   allowDuplicateName?: boolean;
+  /**
+   * Re-index every repo in ~/.gitnexus/registry.json (#253). When set,
+   * [path], --name, and --allow-duplicate-name are all rejected — the
+   * batch is a fleet operation, not a single-repo command. Each entry
+   * is processed by spawning a child `gitnexus analyze <path>` so that
+   * state (LadybugDB handles, progress bar, monkey-patched console)
+   * never carries between iterations — if one repo crashes, the others
+   * proceed untouched. Same per-repo error tolerance as `clean --all`.
+   */
+  all?: boolean;
 }
+
+/**
+ * `analyze --all` implementation (#253): spawn a child
+ * `gitnexus analyze <path>` for each entry in the global registry,
+ * inheriting stdio. Child-process isolation means:
+ *   - each repo gets a fresh LadybugDB handle, progress bar, and heap
+ *   - a crash in one repo cannot bring down sibling cleanups
+ *   - the existing analyze flow (SIGINT, ensureHeap, progress-bar
+ *     monkey-patching) is reused verbatim — no in-process state
+ *     reset hazards
+ *
+ * Forwarded flags: --force, --embeddings, --skills, --skip-agents-md,
+ * --no-stats, --skip-git, -v. NOT forwarded: --name,
+ * --allow-duplicate-name (per-repo concepts; validated out above),
+ * [path] positional (ditto).
+ *
+ * Exit code: 0 when all entries succeeded or were cleanly skipped
+ * (missing-path entries). 1 when at least one entry's child exited
+ * non-zero — surfaces batch partial-failure to cron / CI.
+ */
+const analyzeAllBranch = async (options: AnalyzeOptions | undefined): Promise<void> => {
+  const entries = await listRegisteredRepos();
+  if (entries.length === 0) {
+    console.log('\n  No indexed repositories found.');
+    console.log('  Run `gitnexus analyze <path>` in a repo to index it first.\n');
+    return;
+  }
+
+  console.log(`\n  GitNexus Analyzer — batch mode (${entries.length} repo(s))\n`);
+
+  // Resolve the CLI entrypoint once so each child spawn re-uses it. Use
+  // the same path the current process was launched with — that way
+  // `dist/` vs source-via-tsx works identically in CI, dev, and
+  // end-user installs. `process.argv[1]` is the path to index.js (or
+  // the tsx'd index.ts during tests).
+  const cliEntry = process.argv[1];
+  if (!cliEntry) {
+    console.error('Error: could not determine gitnexus CLI path from process.argv[1].');
+    process.exitCode = 1;
+    return;
+  }
+
+  // Build the forwarded-flag list once — same for every child. This
+  // deliberately excludes --all itself (prevents infinite recursion),
+  // --name, --allow-duplicate-name (per-repo), and the [path]
+  // positional (each child gets the registry entry's path instead).
+  const forwarded: string[] = [];
+  if (options?.force) forwarded.push('--force');
+  if (options?.embeddings) forwarded.push('--embeddings');
+  if (options?.skills) forwarded.push('--skills');
+  if (options?.skipAgentsMd) forwarded.push('--skip-agents-md');
+  if (options?.noStats) forwarded.push('--no-stats');
+  if (options?.skipGit) forwarded.push('--skip-git');
+  if (options?.verbose) forwarded.push('--verbose');
+
+  let succeeded = 0;
+  let skipped = 0;
+  let failed = 0;
+  const failedNames: string[] = [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    console.log(`\n  [${i + 1}/${entries.length}] Analyzing: ${entry.name} (${entry.path})`);
+
+    // Skip entries whose repo has been deleted externally. Same
+    // error-tolerance principle as `clean --all`: a stale registry
+    // entry should not halt the batch.
+    try {
+      if (!fsSync.existsSync(entry.path)) {
+        console.warn(`  ⚠ Skipped (path no longer exists): ${entry.path}`);
+        skipped++;
+        continue;
+      }
+    } catch (err) {
+      console.warn(`  ⚠ Skipped (stat error): ${entry.name}: ${(err as Error).message}`);
+      skipped++;
+      continue;
+    }
+
+    // Spawn a child `gitnexus analyze <path>` with the forwarded flags
+    // and inherited stdio so the child's own progress bar / logs flow
+    // through naturally.
+    //
+    // Propagating `process.execArgv` is critical for the test suite
+    // (and any other tsx-loaded invocation): execArgv holds Node-level
+    // flags like `--import <tsx-loader-url>` that aren't part of argv.
+    // Without them, the child can't load .ts sources and dies with
+    // `ERR_UNKNOWN_FILE_EXTENSION`. In production (npm install of the
+    // compiled package), execArgv is typically empty, so this is a
+    // no-op — but it makes the CLI equally usable under tsx/tsnode dev
+    // setups and in vitest-spawned integration tests.
+    const result = spawnSync(
+      process.execPath,
+      [...process.execArgv, cliEntry, 'analyze', entry.path, ...forwarded],
+      {
+        stdio: 'inherit',
+        env: process.env,
+      },
+    );
+
+    if (result.status === 0) {
+      succeeded++;
+    } else {
+      failed++;
+      failedNames.push(entry.name);
+      const reason =
+        result.signal !== null
+          ? `signal ${result.signal}`
+          : result.error
+            ? (result.error as Error).message
+            : `exit code ${result.status}`;
+      console.error(`  ✗ Failed (${reason}): ${entry.name}`);
+    }
+  }
+
+  console.log(
+    `\n  Summary: ${succeeded} succeeded, ${skipped} skipped, ${failed} failed.` +
+      (failed > 0 ? `\n  Failed: ${failedNames.join(', ')}\n` : '\n'),
+  );
+
+  // Exit non-zero on any failure so cron / CI pick up partial-failure
+  // conditions. Skipped entries (missing paths) are NOT failures —
+  // they're just registry self-heal candidates that `list --validate`
+  // would clean up on next read.
+  if (failed > 0) process.exitCode = 1;
+};
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (ensureHeap()) return;
 
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
+  }
+
+  // ── `analyze --all` branch (#253) ──────────────────────────────────
+  //
+  // Validate mutual exclusions up-front so the user sees a clear error
+  // BEFORE any registry or filesystem work happens. Each flag is
+  // incompatible with --all because it's inherently per-repo:
+  //   - [path]              → --all iterates the registry; the user
+  //                           can't also pin a single path
+  //   - --name <alias>      → an alias targets one repo
+  //   - --allow-duplicate-name → same (registry-collision semantics)
+  if (options?.all) {
+    const violations: string[] = [];
+    if (inputPath) violations.push('[path] positional argument');
+    if (options.name !== undefined) violations.push('--name <alias>');
+    if (options.allowDuplicateName) violations.push('--allow-duplicate-name');
+    if (violations.length > 0) {
+      console.error(
+        `Error: --all cannot be combined with ${violations.join(', ')}. ` +
+          `--all re-indexes every registered repo; these flags target a single repo.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    return analyzeAllBranch(options);
   }
 
   console.log('\n  GitNexus Analyzer\n');
