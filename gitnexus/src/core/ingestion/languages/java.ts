@@ -7,7 +7,9 @@
  * interface implementation.
  */
 
-import { SupportedLanguages } from 'gitnexus-shared';
+import { SupportedLanguages, type NodeLabel } from 'gitnexus-shared';
+import type { CaptureMap } from '../language-provider.js';
+import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { javaClassConfig } from '../class-extractors/configs/jvm.js';
 import { defineLanguage } from '../language-provider.js';
@@ -39,6 +41,100 @@ import {
   javaArityCompatibility,
   resolveJavaImportTarget,
 } from './java/index.js';
+
+/**
+ * Extract Javadoc / KDoc description from the nearest preceding block comment.
+ *
+ * Walks `previousSibling` from the definition node, stopping at the first
+ * contiguous run of `block_comment` nodes that begins with `/**`. Stops
+ * earlier if a non-comment named sibling is encountered (mirrors the Ruby
+ * YARD extractor in call-routing.ts).
+ */
+export function extractJavaDocComment(definitionNode: SyntaxNode): string | undefined {
+  let sibling = definitionNode.previousSibling;
+  const lines: string[] = [];
+
+  while (sibling) {
+    if (sibling.type === 'block_comment') {
+      const text = sibling.text;
+      if (text.startsWith('/**')) {
+        lines.unshift(text);
+        // A single Javadoc is one block_comment node; stop here.
+        break;
+      }
+      sibling = sibling.previousSibling;
+      continue;
+    }
+    if (sibling.isNamed) {
+      // Stop at any named non-comment sibling (e.g., another method,
+      // field, or annotation). We don't want to walk across unrelated
+      // definitions.
+      break;
+    }
+    sibling = sibling.previousSibling;
+  }
+
+  if (lines.length === 0) return undefined;
+
+  const raw = lines.join('\n');
+
+  // Strip `/**` prefix and `*/` suffix, then process each line.
+  const inner = raw
+    .replace(/^\/\*\*/, '')
+    .replace(/\*\/$/, '');
+
+  const processed = inner
+    .split('\n')
+    .map((line) => {
+      // Strip leading `*` and whitespace from each line.
+      const stripped = line.replace(/^\s*\*\s?/, '');
+      return stripped.trim();
+    })
+    .filter((line) => line.length > 0);
+
+  // Stop at the first `@` tag line (e.g., `@param`, `@return`) so only
+  // the human-readable summary is captured.
+  const firstNonTagIndex = processed.findIndex((line) => !line.startsWith('@'));
+  if (firstNonTagIndex === -1) return undefined;
+  // Take all lines from the first non-tag up to (but not including) the first tag.
+  const summaryLines = processed.slice(firstNonTagIndex);
+  const firstTagAfter = summaryLines.findIndex((line) => line.startsWith('@'));
+  const descriptionLines = firstTagAfter === -1 ? summaryLines : summaryLines.slice(0, firstTagAfter);
+
+  const normalized = descriptionLines
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return undefined;
+
+  // Cap at the embedding pipeline's default max description length.
+  const MAX_DESC = 150;
+  return normalized.length > MAX_DESC ? normalized.slice(0, MAX_DESC) : normalized;
+}
+
+export function javaDescriptionExtractor(
+  nodeLabel: NodeLabel,
+  _nodeName: string,
+  captureMap: CaptureMap,
+): string | undefined {
+  // Map node labels to the capture tag names used in JAVA_QUERIES.
+  const tagByLabel: Record<string, string> = {
+    Class: 'definition.class',
+    Interface: 'definition.interface',
+    Enum: 'definition.enum',
+    Method: 'definition.method',
+    Constructor: 'definition.constructor',
+  };
+
+  const tag = tagByLabel[nodeLabel];
+  if (!tag) return undefined;
+
+  const node = captureMap[tag];
+  if (!node) return undefined;
+
+  return extractJavaDocComment(node);
+}
 
 const orderJavaSameNameTypeCandidates = ({
   callSiteFilePath,
@@ -116,6 +212,7 @@ export const javaProvider = defineLanguage({
   methodExtractor: createMethodExtractor(javaMethodConfig),
   variableExtractor: createVariableExtractor(javaVariableConfig),
   classExtractor: createClassExtractor(javaClassConfig),
+  descriptionExtractor: javaDescriptionExtractor,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks ──
   emitScopeCaptures: emitJavaScopeCaptures,
