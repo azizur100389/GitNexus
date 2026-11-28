@@ -250,6 +250,20 @@ describe('indexCommand', () => {
     expect(process.exitCode).toBe(1);
   });
 
+  it('fails without --force when metadata is missing after storage validation', async () => {
+    const storagePath = path.resolve('/external/index');
+    mockRequireStoragePath.mockResolvedValueOnce(storagePath);
+    mockLoadMeta.mockResolvedValueOnce(null);
+
+    const { indexCommand } = await import('../../src/cli/index-repo.js');
+    await indexCommand(['/repo']);
+
+    expect(mockLoadMeta).toHaveBeenCalledWith(storagePath);
+    expect(mockSaveMeta).not.toHaveBeenCalled();
+    expect(mockRegisterRepo).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
+  });
+
   it('registers successfully with existing metadata', async () => {
     const { indexCommand } = await import('../../src/cli/index-repo.js');
     await indexCommand(['/repo']);
