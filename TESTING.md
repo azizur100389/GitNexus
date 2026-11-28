@@ -25,7 +25,7 @@ From `gitnexus/`:
 | `npm run test:conformance:java` | javac comparisons and GitNexus product checks      | After building the CLI (JDK 21)       |
 | `npm run test:conformance:typescript` | TypeScript compiler comparisons and Node module checks | After building the CLI |
 | `npm run test:coverage`         | Full suite + v8 coverage with thresholds           | Checking coverage impact              |
-| `npm run test:parity`           | Scope-resolution parity for all migrated languages | After changing resolver or scope code |
+| `npm test -- test/integration/resolvers/c.test.ts` | One resolver integration suite (C shown; substitute the affected suite) | After building the CLI with resolver changes |
 | `npm run test:cross-platform`   | Platform-sensitive subset only                     | Debugging a Windows/macOS issue       |
 | `npm run test:watch`            | Vitest in watch mode                               | Active development                    |
 | `npm run test:dupes`            | Duplicate-test scan of lines changed vs `main`     | Before adding tests or benchmarks     |
